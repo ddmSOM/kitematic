@@ -3,12 +3,14 @@ import fs from 'fs';
 import path from 'path';
 import dockerode from 'dockerode';
 import _ from 'underscore';
+import child_process from 'child_process';
 import util from './Util';
 import hubUtil from './HubUtil';
 import metrics from '../utils/MetricsUtil';
 import containerServerActions from '../actions/ContainerServerActions';
 import rimraf from 'rimraf';
 import stream from 'stream';
+import JSONStream from 'JSONStream';
 
 export default {
   host: null,
@@ -22,20 +24,25 @@ export default {
       throw new Error('Falsy ip or name passed to docker client setup');
     }
 
-    let certDir = path.join(util.home(), '.docker/machine/machines/', name);
-    if (!fs.existsSync(certDir)) {
-      throw new Error('Certificate directory does not exist');
-    }
+    if (util.isLinux()) {
+      this.host = 'localhost';
+      this.client = new dockerode({socketPath: '/var/run/docker.sock'});
+    } else {
+      let certDir = path.join(util.home(), '.docker/machine/machines/', name);
+      if (!fs.existsSync(certDir)) {
+        throw new Error('Certificate directory does not exist');
+      }
 
-    this.host = ip;
-    this.client = new dockerode({
-      protocol: 'https',
-      host: ip,
-      port: 2376,
-      ca: fs.readFileSync(path.join(certDir, 'ca.pem')),
-      cert: fs.readFileSync(path.join(certDir, 'cert.pem')),
-      key: fs.readFileSync(path.join(certDir, 'key.pem'))
-    });
+      this.host = ip;
+      this.client = new dockerode({
+        protocol: 'https',
+        host: ip,
+        port: 2376,
+        ca: fs.readFileSync(path.join(certDir, 'ca.pem')),
+        cert: fs.readFileSync(path.join(certDir, 'cert.pem')),
+        key: fs.readFileSync(path.join(certDir, 'key.pem'))
+      });
+    }
   },
 
   init () {
@@ -68,21 +75,17 @@ export default {
     });
   },
 
-  startContainer (name, containerData) {
-    let startopts = {
-      Binds: containerData.Binds || []
-    };
-
-    if (containerData.NetworkSettings && containerData.NetworkSettings.Ports) {
-      startopts.PortBindings = containerData.NetworkSettings.Ports;
-    } else if (containerData.HostConfig && containerData.HostConfig.PortBindings) {
-      startopts.PortBindings = containerData.HostConfig.PortBindings;
-    } else {
-      startopts.PublishAllPorts = true;
+  isDockerRunning () {
+    try {
+      child_process.execSync('ps ax | grep "docker daemon" | grep -v grep');
+    } catch (error) {
+      throw new Error('Cannot connect to the Docker daemon. The daemon is not running.');
     }
+  },
 
+  startContainer (name) {
     let container = this.client.getContainer(name);
-    container.start(startopts, (error) => {
+    container.start((error) => {
       if (error) {
         containerServerActions.error({name, error});
         return;
@@ -111,7 +114,16 @@ export default {
         return;
       }
 
-      containerData.Cmd = image.Config.Cmd || 'bash';
+      if (!containerData.HostConfig || (containerData.HostConfig && !containerData.HostConfig.PortBindings)) {
+        containerData.PublishAllPorts = true;
+      }
+      
+      if (image.Config.Cmd) {
+        containerData.Cmd = image.Config.Cmd;
+      } else if (!image.Config.Entrypoint) {
+        containerData.Cmd = 'bash';
+      }
+
       let existing = this.client.getContainer(name);
       existing.kill(() => {
         existing.remove(() => {
@@ -121,7 +133,7 @@ export default {
               return;
             }
             metrics.track('Container Finished Creating');
-            this.startContainer(name, containerData);
+            this.startContainer(name);
             delete this.placeholders[name];
             localStorage.setItem('placeholders', JSON.stringify(this.placeholders));
           });
@@ -233,19 +245,8 @@ export default {
         existingData.Tty = existingData.Config.Tty;
         existingData.OpenStdin = existingData.Config.OpenStdin;
       }
-      let networking = _.extend(existingData.NetworkSettings, data.NetworkSettings);
-      if (networking && networking.Ports) {
-        let exposed = _.reduce(networking.Ports, (res, value, key) => {
-          res[key] = {};
-          return res;
-        }, {});
-        data = _.extend(data, {
-          HostConfig: {
-            PortBindings: networking.Ports
-          },
-          ExposedPorts: exposed
-        });
-      }
+
+      data.Mounts = data.Mounts || existingData.Mounts;
 
       var fullData = _.extend(existingData, data);
       this.createContainer(name, fullData);
@@ -258,8 +259,8 @@ export default {
         containerServerActions.error({name, error});
         return;
       }
-      var oldPath = path.join(util.home(), 'Kitematic', name);
-      var newPath = path.join(util.home(), 'Kitematic', newName);
+      var oldPath = util.windowsToLinuxPath(path.join(util.home(), util.documents(), 'Kitematic', name));
+      var newPath = util.windowsToLinuxPath(path.join(util.home(), util.documents(), 'Kitematic', newName));
 
       this.client.getContainer(newName).inspect((error, container) => {
         if (error) {
@@ -270,13 +271,12 @@ export default {
           if (fs.existsSync(oldPath)) {
             fs.renameSync(oldPath, newPath);
           }
-          var binds = _.pairs(container.Volumes).map(function (pair) {
-            return pair[1] + ':' + pair[0];
+
+          container.Mounts.forEach(m => {
+            m.Source = m.Source.replace(oldPath, newPath);
           });
-          var newBinds = binds.map(b => {
-            return b.replace(path.join(util.home(), 'Kitematic', name), path.join(util.home(), 'Kitematic', newName));
-          });
-          this.updateContainer(newName, {Binds: newBinds});
+
+          this.updateContainer(newName, {Mounts: container.Mounts});
           rimraf(oldPath, () => {});
         });
       });
@@ -432,9 +432,7 @@ export default {
       }
 
       stream.setEncoding('utf8');
-      stream.on('data', json => {
-        let data = JSON.parse(json);
-
+      stream.pipe(JSONStream.parse()).on('data', data => {
         if (data.status === 'pull' || data.status === 'untag' || data.status === 'delete' ||  data.status === 'attach') {
           return;
         }
@@ -495,9 +493,7 @@ export default {
       let error = null;
 
       // data is associated with one layer only (can be identified with id)
-      stream.on('data', str => {
-        var data = JSON.parse(str);
-
+      stream.pipe(JSONStream.parse()).on('data', data => {
         if (data.error) {
           error = data.error;
           return;
